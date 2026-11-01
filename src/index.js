@@ -6,9 +6,9 @@ export default {
     if (url.pathname === "/") {
       return Response.json({
         project: "ChatGPT Cloudflare Lab",
-        version: "V1",
+        version: "V2",
         status: "running",
-        message: "Worker is working!"
+        database: "D1 connected"
       });
     }
 
@@ -17,6 +17,33 @@ export default {
         ok: true,
         service: "chatgpt-cloudflare-lab"
       });
+    }
+
+    if (
+      url.pathname === "/api/posts" &&
+      request.method === "GET"
+    ) {
+      try {
+        const { results } = await env.DB
+          .prepare(
+            "SELECT id, title, content, image_url, status, created_at FROM posts ORDER BY id DESC LIMIT 50"
+          )
+          .all();
+
+        return Response.json({
+          success: true,
+          count: results.length,
+          posts: results
+        });
+      } catch (error) {
+        return Response.json(
+          {
+            success: false,
+            error: "Database query failed"
+          },
+          { status: 500 }
+        );
+      }
     }
 
     return Response.json(
