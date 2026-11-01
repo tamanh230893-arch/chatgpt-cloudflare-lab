@@ -3,5 +3,12 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "chatgpt-cloudflare-lab",
   "main": "src/index.js",
-  "compatibility_date": "2026-11-01"
+  "compatibility_date": "2026-11-01",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "chatgpt_lab_db",
+      "database_id": "THAY_BANG_DATABASE_ID_CUA_BAN"
+    }
+  ]
 }
