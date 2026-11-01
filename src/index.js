@@ -3,12 +3,10 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 
-// =====================================================
-// ChatGPT Cloudflare Lab V6
-// Cloudflare Worker + D1 + GitHub Image Storage
-// =====================================================
+// ChatGPT Cloudflare Lab V7
+// MCP + D1 + GitHub Image Storage + iPad Dashboard
 
-const VERSION = "6.0.0";
+const VERSION = "7.0.0";
 
 const GITHUB_OWNER = "tamanh230893-arch";
 const GITHUB_REPO = "chatgpt-lab-images";
@@ -22,9 +20,18 @@ const ALLOWED_IMAGE_TYPES = {
   "image/webp": "webp"
 };
 
-// =====================================================
+// ----------------------------
 // Helpers
-// =====================================================
+// ----------------------------
+
+function json(data, status = 200) {
+  return Response.json(data, {
+    status,
+    headers: {
+      "Cache-Control": "no-store"
+    }
+  });
+}
 
 function toolResult(data, isError = false) {
   return {
@@ -45,6 +52,10 @@ function decodeImage(base64, mimeType) {
     throw new Error("Unsupported image type");
   }
 
+  if (typeof base64 !== "string") {
+    throw new Error("Invalid image data");
+  }
+
   const clean = base64.replace(
     /^data:image\/(?:png|jpeg|webp);base64,/,
     ""
@@ -60,7 +71,7 @@ function decodeImage(base64, mimeType) {
 
   const bytes = Uint8Array.from(
     atob(clean),
-    (character) => character.charCodeAt(0)
+    character => character.charCodeAt(0)
   );
 
   if (
@@ -111,26 +122,52 @@ function validateImageUrl(imageUrl) {
     throw new Error("Invalid image URL");
   }
 
-  const expectedPrefix =
+  const prefix =
     `/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}/images/`;
 
   if (
     parsed.protocol !== "https:" ||
     parsed.hostname !== "raw.githubusercontent.com" ||
-    !parsed.pathname.startsWith(expectedPrefix) ||
+    !parsed.pathname.startsWith(prefix) ||
     !/\.(png|jpg|jpeg|webp)$/i.test(parsed.pathname) ||
     parsed.search ||
     parsed.hash
   ) {
-    throw new Error("Image URL must belong to the GitHub image repository");
+    throw new Error("Invalid GitHub image URL");
   }
 
   return parsed.href;
 }
 
-// =====================================================
-// Upload Image to GitHub
-// =====================================================
+function validatePost(data) {
+  if (
+    !data ||
+    typeof data.title !== "string" ||
+    typeof data.content !== "string"
+  ) {
+    throw new Error("Invalid post data");
+  }
+
+  const title = data.title.trim();
+  const content = data.content.trim();
+
+  if (
+    !title ||
+    !content ||
+    title.length > 200 ||
+    content.length > 15000
+  ) {
+    throw new Error(
+      "Title or content is empty or too long"
+    );
+  }
+
+  return { title, content };
+}
+
+// ----------------------------
+// GitHub image upload
+// ----------------------------
 
 async function uploadToGitHub(
   env,
@@ -141,7 +178,10 @@ async function uploadToGitHub(
     throw new Error("GITHUB_TOKEN is missing");
   }
 
-  const image = decodeImage(imageBase64, mimeType);
+  const image = decodeImage(
+    imageBase64,
+    mimeType
+  );
 
   const filename =
     `${crypto.randomUUID()}.${image.extension}`;
@@ -185,19 +225,71 @@ async function uploadToGitHub(
   };
 }
 
-// =====================================================
-// MCP Server
-// =====================================================
+// ----------------------------
+// D1 functions
+// ----------------------------
+
+async function listPosts(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT
+      id,
+      title,
+      content,
+      image_url,
+      status,
+      created_at
+     FROM posts
+     ORDER BY id DESC
+     LIMIT 50`
+  ).all();
+
+  return results;
+}
+
+async function savePost(
+  env,
+  title,
+  content,
+  imageUrl = null
+) {
+  const post = validatePost({
+    title,
+    content
+  });
+
+  const validImageUrl = imageUrl
+    ? validateImageUrl(imageUrl)
+    : null;
+
+  const result = await env.DB.prepare(
+    `INSERT INTO posts
+       (title, content, image_url, status)
+     VALUES (?, ?, ?, 'draft')`
+  )
+    .bind(
+      post.title,
+      post.content,
+      validImageUrl
+    )
+    .run();
+
+  return {
+    success: true,
+    id: result.meta.last_row_id,
+    image_url: validImageUrl,
+    status: "draft"
+  };
+}
+
+// ----------------------------
+// MCP Server - preserve V6 tools
+// ----------------------------
 
 function createServer(env) {
   const server = new McpServer({
     name: "ChatGPT Cloudflare Lab",
     version: VERSION
   });
-
-  // ---------------------------------------------------
-  // Tool 1: list_posts
-  // ---------------------------------------------------
 
   server.registerTool(
     "list_posts",
@@ -208,23 +300,12 @@ function createServer(env) {
     },
     async () => {
       try {
-        const { results } = await env.DB.prepare(
-          `SELECT
-             id,
-             title,
-             content,
-             image_url,
-             status,
-             created_at
-           FROM posts
-           ORDER BY id DESC
-           LIMIT 50`
-        ).all();
+        const posts = await listPosts(env);
 
         return toolResult({
           success: true,
-          count: results.length,
-          posts: results
+          count: posts.length,
+          posts
         });
       } catch {
         return toolResult(
@@ -237,10 +318,6 @@ function createServer(env) {
       }
     }
   );
-
-  // ---------------------------------------------------
-  // Tool 2: save_post
-  // ---------------------------------------------------
 
   server.registerTool(
     "save_post",
@@ -255,19 +332,13 @@ function createServer(env) {
     },
     async ({ title, content }) => {
       try {
-        const result = await env.DB.prepare(
-          `INSERT INTO posts
-             (title, content, status)
-           VALUES (?, ?, 'draft')`
-        )
-          .bind(title.trim(), content.trim())
-          .run();
-
-        return toolResult({
-          success: true,
-          id: result.meta.last_row_id,
-          status: "draft"
-        });
+        return toolResult(
+          await savePost(
+            env,
+            title,
+            content
+          )
+        );
       } catch {
         return toolResult(
           {
@@ -280,19 +351,14 @@ function createServer(env) {
     }
   );
 
-  // ---------------------------------------------------
-  // Tool 3: upload_image
-  // ---------------------------------------------------
-
   server.registerTool(
     "upload_image",
     {
       description:
-        "Upload an actual PNG, JPEG or WebP image " +
-        "(maximum 2 MB) to the public GitHub repository. " +
+        "Upload a PNG, JPEG or WebP image, maximum 2 MB, " +
+        "to the public GitHub image repository. " +
         "Requires explicit user approval. " +
-        "Accepts real Base64 image data, not a filename " +
-        "or a ChatGPT image reference.",
+        "Accepts actual Base64 image data.",
       inputSchema: {
         image_base64: z.string().min(1),
         mime_type: z.enum([
@@ -304,13 +370,13 @@ function createServer(env) {
     },
     async ({ image_base64, mime_type }) => {
       try {
-        const result = await uploadToGitHub(
-          env,
-          image_base64,
-          mime_type
+        return toolResult(
+          await uploadToGitHub(
+            env,
+            image_base64,
+            mime_type
+          )
         );
-
-        return toolResult(result);
       } catch (error) {
         return toolResult(
           {
@@ -322,10 +388,6 @@ function createServer(env) {
       }
     }
   );
-
-  // ---------------------------------------------------
-  // Tool 4: save_post_with_image
-  // ---------------------------------------------------
 
   server.registerTool(
     "save_post_with_image",
@@ -343,27 +405,14 @@ function createServer(env) {
     },
     async ({ title, content, image_url }) => {
       try {
-        const validImageUrl =
-          validateImageUrl(image_url);
-
-        const result = await env.DB.prepare(
-          `INSERT INTO posts
-             (title, content, image_url, status)
-           VALUES (?, ?, ?, 'draft')`
-        )
-          .bind(
-            title.trim(),
-            content.trim(),
-            validImageUrl
+        return toolResult(
+          await savePost(
+            env,
+            title,
+            content,
+            image_url
           )
-          .run();
-
-        return toolResult({
-          success: true,
-          id: result.meta.last_row_id,
-          image_url: validImageUrl,
-          status: "draft"
-        });
+        );
       } catch (error) {
         return toolResult(
           {
@@ -379,27 +428,489 @@ function createServer(env) {
   return server;
 }
 
-// =====================================================
-// Cloudflare Worker
-// =====================================================
+// ----------------------------
+// Dashboard HTML
+// ----------------------------
+
+function dashboardHtml() {
+  return `<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport"
+ content="width=device-width, initial-scale=1">
+
+<title>AI Control Center V7</title>
+
+<style>
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 18px;
+  background: #f3f5f9;
+  font-family: system-ui, sans-serif;
+  color: #172033;
+}
+
+.container {
+  max-width: 760px;
+  margin: auto;
+}
+
+h1 {
+  font-size: 26px;
+  margin-bottom: 6px;
+}
+
+.subtitle {
+  color: #64748b;
+  margin-bottom: 22px;
+}
+
+.card {
+  background: white;
+  padding: 20px;
+  border-radius: 16px;
+  margin-bottom: 18px;
+  box-shadow: 0 3px 14px rgba(0,0,0,.05);
+}
+
+label {
+  display: block;
+  font-weight: 600;
+  margin: 14px 0 7px;
+}
+
+input[type="text"],
+textarea {
+  width: 100%;
+  padding: 13px;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  font-size: 16px;
+  font-family: inherit;
+}
+
+textarea {
+  min-height: 220px;
+  resize: vertical;
+}
+
+input[type="file"] {
+  width: 100%;
+  padding: 12px 0;
+}
+
+button {
+  border: 0;
+  background: #2563eb;
+  color: white;
+  padding: 14px 20px;
+  border-radius: 10px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: .55;
+  cursor: wait;
+}
+
+.secondary {
+  background: #475569;
+}
+
+#preview {
+  max-width: 100%;
+  max-height: 300px;
+  border-radius: 10px;
+  margin-top: 12px;
+  display: none;
+}
+
+#message {
+  margin-top: 14px;
+  white-space: pre-wrap;
+  font-weight: 600;
+}
+
+.post {
+  padding: 15px 0;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.post:last-child {
+  border-bottom: 0;
+}
+
+.post h3 {
+  margin: 0 0 6px;
+  overflow-wrap: anywhere;
+}
+
+.post p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: #475569;
+}
+
+.post img {
+  max-width: 220px;
+  width: 100%;
+  border-radius: 8px;
+}
+
+.status {
+  display: inline-block;
+  padding: 4px 9px;
+  border-radius: 20px;
+  background: #dbeafe;
+  color: #1d4ed8;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.note {
+  font-size: 13px;
+  color: #64748b;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+</style>
+</head>
+
+<body>
+<div class="container">
+
+<h1>🤖 AI Control Center V7</h1>
+<p class="subtitle">
+  Quản lý bài viết Facebook bằng iPad
+</p>
+
+<section class="card">
+<h2>✍️ Tạo bài viết mới</h2>
+
+<form id="postForm">
+
+<label for="title">Tiêu đề</label>
+<input
+  id="title"
+  type="text"
+  maxlength="200"
+  placeholder="Nhập tiêu đề bài viết"
+  required
+>
+
+<label for="content">Nội dung</label>
+<textarea
+  id="content"
+  maxlength="15000"
+  placeholder="Nhập nội dung Facebook..."
+  required
+></textarea>
+
+<label for="image">Hình ảnh</label>
+<input
+  id="image"
+  type="file"
+  accept="image/png,image/jpeg,image/webp"
+>
+
+<img id="preview" alt="Xem trước hình ảnh">
+
+<p class="note">
+  Hỗ trợ PNG, JPG, WebP. Tối đa 2 MB.
+</p>
+
+<button id="saveButton" type="submit">
+  💾 Lưu bản nháp
+</button>
+
+<div id="message" role="status"></div>
+
+</form>
+</section>
+
+<section class="card">
+<h2>📋 Danh sách bài viết</h2>
+
+<div class="actions">
+<button
+  class="secondary"
+  id="refreshButton"
+  type="button"
+>
+  🔄 Làm mới
+</button>
+</div>
+
+<div id="posts">
+  Đang tải...
+</div>
+
+</section>
+
+<p class="note">
+  Phiên bản thử nghiệm.
+  Không có chức năng đăng Facebook tự động.
+</p>
+
+</div>
+
+<script>
+const form = document.getElementById("postForm");
+const imageInput = document.getElementById("image");
+const preview = document.getElementById("preview");
+const message = document.getElementById("message");
+const saveButton = document.getElementById("saveButton");
+const postsContainer = document.getElementById("posts");
+
+imageInput.addEventListener("change", function () {
+  const file = imageInput.files[0];
+
+  if (!file) {
+    preview.style.display = "none";
+    preview.removeAttribute("src");
+    return;
+  }
+
+  if (file.size > 2 * 1024 * 1024) {
+    alert("Ảnh phải nhỏ hơn hoặc bằng 2 MB");
+    imageInput.value = "";
+    preview.style.display = "none";
+    return;
+  }
+
+  const url = URL.createObjectURL(file);
+
+  preview.onload = function () {
+    URL.revokeObjectURL(url);
+  };
+
+  preview.src = url;
+  preview.style.display = "block";
+});
+
+function readFileAsBase64(file) {
+  return new Promise(function (resolve, reject) {
+    const reader = new FileReader();
+
+    reader.onload = function () {
+      const value = String(reader.result);
+      resolve(value.split(",")[1]);
+    };
+
+    reader.onerror = function () {
+      reject(new Error("Không đọc được ảnh"));
+    };
+
+    reader.readAsDataURL(file);
+  });
+}
+
+async function requestJson(url, options) {
+  const response = await fetch(url, options);
+  const data = await response.json();
+
+  if (!response.ok || !data.success) {
+    throw new Error(
+      data.error || "Yêu cầu thất bại"
+    );
+  }
+
+  return data;
+}
+
+form.addEventListener("submit", async function (event) {
+  event.preventDefault();
+
+  const title = document.getElementById("title").value.trim();
+  const content = document.getElementById("content").value.trim();
+  const file = imageInput.files[0];
+
+  if (!title || !content) {
+    message.textContent = "Vui lòng nhập tiêu đề và nội dung.";
+    return;
+  }
+
+  if (!confirm("Lưu bài viết này vào Cloudflare D1 dưới dạng draft?")) {
+    return;
+  }
+
+  saveButton.disabled = true;
+  message.style.color = "#1d4ed8";
+  message.textContent = "Đang xử lý...";
+
+  try {
+    let imageUrl = null;
+
+    if (file) {
+      if (file.size > 2 * 1024 * 1024) {
+        throw new Error("Ảnh vượt quá 2 MB");
+      }
+
+      message.textContent = "Đang tải ảnh lên GitHub...";
+
+      const imageBase64 = await readFileAsBase64(file);
+
+      const uploaded = await requestJson(
+        "/api/upload-image",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            image_base64: imageBase64,
+            mime_type: file.type
+          })
+        }
+      );
+
+      imageUrl = uploaded.image_url;
+    }
+
+    message.textContent = "Đang lưu vào D1...";
+
+    const saved = await requestJson(
+      "/api/posts",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          title: title,
+          content: content,
+          image_url: imageUrl
+        })
+      }
+    );
+
+    message.style.color = "#15803d";
+    message.textContent =
+      "✅ Đã lưu POST-" +
+      String(saved.id).padStart(4, "0") +
+      " | Trạng thái: draft";
+
+    form.reset();
+    preview.style.display = "none";
+    preview.removeAttribute("src");
+
+    await loadPosts();
+
+  } catch (error) {
+    message.style.color = "#b91c1c";
+    message.textContent =
+      "❌ " + error.message +
+      "\\nNếu ảnh đã tải lên nhưng lưu D1 lỗi, " +
+      "ảnh có thể vẫn nằm trên GitHub.";
+  } finally {
+    saveButton.disabled = false;
+  }
+});
+
+function createTextElement(tag, text) {
+  const element = document.createElement(tag);
+  element.textContent = text;
+  return element;
+}
+
+async function loadPosts() {
+  postsContainer.textContent = "Đang tải...";
+
+  try {
+    const data = await requestJson("/api/posts");
+
+    postsContainer.replaceChildren();
+
+    if (!data.posts.length) {
+      postsContainer.textContent = "Chưa có bài viết.";
+      return;
+    }
+
+    data.posts.forEach(function (post) {
+      const card = document.createElement("div");
+      card.className = "post";
+
+      const heading = createTextElement(
+        "h3",
+        "POST-" +
+        String(post.id).padStart(4, "0") +
+        " — " + post.title
+      );
+
+      const status = createTextElement(
+        "span",
+        post.status || "draft"
+      );
+      status.className = "status";
+
+      const content = createTextElement(
+        "p",
+        post.content || ""
+      );
+
+      card.append(heading, status, content);
+
+      if (post.image_url) {
+        const img = document.createElement("img");
+        img.src = post.image_url;
+        img.alt = "Ảnh bài viết";
+        img.loading = "lazy";
+        card.appendChild(img);
+      }
+
+      postsContainer.appendChild(card);
+    });
+
+  } catch (error) {
+    postsContainer.textContent =
+      "Không tải được bài viết: " + error.message;
+  }
+}
+
+document.getElementById("refreshButton")
+  .addEventListener("click", loadPosts);
+
+loadPosts();
+</script>
+</body>
+</html>`;
+}
+
+// ----------------------------
+// Worker routes
+// ----------------------------
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
 
-    // MCP endpoint
-    if (url.pathname === "/mcp") {
+    // Preserve existing MCP endpoint
+    if (path === "/mcp") {
       return createMcpHandler(
         () => createServer(env)
       )(request, env, ctx);
     }
 
     // Health check
-    if (url.pathname === "/") {
-      return Response.json({
+    if (path === "/" && method === "GET") {
+      return json({
         project: "ChatGPT Cloudflare Lab",
-        version: "V6",
+        version: VERSION,
         status: "running",
+        dashboard: "/dashboard",
         mcp: "/mcp",
         tools: [
           "list_posts",
@@ -410,81 +921,107 @@ export default {
       });
     }
 
-    // Read posts via HTTP API
+    // iPad Dashboard
     if (
-      url.pathname === "/api/posts" &&
-      request.method === "GET"
+      path === "/dashboard" &&
+      method === "GET"
+    ) {
+      return new Response(dashboardHtml(), {
+        headers: {
+          "Content-Type": "text/html; charset=UTF-8",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
+          "Referrer-Policy": "no-referrer"
+        }
+      });
+    }
+
+    // Read posts
+    if (
+      path === "/api/posts" &&
+      method === "GET"
     ) {
       try {
-        const { results } = await env.DB.prepare(
-          `SELECT *
-           FROM posts
-           ORDER BY id DESC
-           LIMIT 50`
-        ).all();
+        const posts = await listPosts(env);
 
-        return Response.json({
+        return json({
           success: true,
-          count: results.length,
-          posts: results
+          count: posts.length,
+          posts
         });
       } catch {
-        return Response.json(
-          { success: false, error: "Database read failed" },
-          { status: 500 }
+        return json(
+          {
+            success: false,
+            error: "Database read failed"
+          },
+          500
         );
       }
     }
 
-    // Save text-only draft via HTTP API
+    // Upload image via HTTP
     if (
-      url.pathname === "/api/posts" &&
-      request.method === "POST"
+      path === "/api/upload-image" &&
+      method === "POST"
+    ) {
+      try {
+        const contentLength = Number(
+          request.headers.get("content-length") || 0
+        );
+
+        if (contentLength > 3 * 1024 * 1024) {
+          return json({
+            success: false,
+            error: "Request is too large"
+          }, 413);
+        }
+
+        const data = await request.json();
+
+        const uploaded = await uploadToGitHub(
+          env,
+          data.image_base64,
+          data.mime_type
+        );
+
+        return json(uploaded);
+
+      } catch (error) {
+        return json({
+          success: false,
+          error: error.message
+        }, 400);
+      }
+    }
+
+    // Save text or image draft
+    if (
+      path === "/api/posts" &&
+      method === "POST"
     ) {
       try {
         const data = await request.json();
 
-        if (
-          typeof data.title !== "string" ||
-          typeof data.content !== "string" ||
-          !data.title.trim() ||
-          !data.content.trim() ||
-          data.title.trim().length > 200 ||
-          data.content.trim().length > 15000
-        ) {
-          return Response.json(
-            { success: false, error: "Invalid data" },
-            { status: 400 }
-          );
-        }
-
-        const result = await env.DB.prepare(
-          `INSERT INTO posts
-             (title, content, status)
-           VALUES (?, ?, 'draft')`
-        )
-          .bind(
-            data.title.trim(),
-            data.content.trim()
-          )
-          .run();
-
-        return Response.json({
-          success: true,
-          id: result.meta.last_row_id,
-          status: "draft"
-        });
-      } catch {
-        return Response.json(
-          { success: false, error: "Database write failed" },
-          { status: 500 }
+        const saved = await savePost(
+          env,
+          data.title,
+          data.content,
+          data.image_url || null
         );
+
+        return json(saved);
+
+      } catch (error) {
+        return json({
+          success: false,
+          error: error.message
+        }, 400);
       }
     }
 
-    return Response.json(
-      { error: "Not found" },
-      { status: 404 }
-    );
+    return json({
+      error: "Not found"
+    }, 404);
   }
 };
