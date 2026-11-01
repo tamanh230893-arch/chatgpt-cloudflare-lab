@@ -8,8 +8,8 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "@modelcontextprotocol/server": "^1.0.0",
-    "agents": "^0.7.0",
+    "@modelcontextprotocol/server": "2.3.1",
+    "agents": "latest",
     "zod": "^4.0.0"
   },
   "devDependencies": {
